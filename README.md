@@ -1,6 +1,8 @@
 # osubgwalls
 
-Download osu beatmap backgrounds!
+*Download osu beatmap backgrounds!*
+
+<img width="595" height="421" alt="image" src="https://github.com/user-attachments/assets/22aeb76a-81ec-4726-9cfc-bd79556eb1d2" />
 
 ## Building
 
