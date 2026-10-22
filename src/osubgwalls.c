@@ -11,11 +11,38 @@
 #include <zip.h>
 
 #define UA "Mozilla/5.0 (X11; Linux x86_64; rv:157.0) Gecko/20100101 Firefox/157.0"
+#define MIN_ID 10000
+#define MAX_ID 2650000
 
 typedef struct libcurl_cb_str {
     char *response;
     size_t size;
 } libcurl_cb_memory;
+
+static int is_saved(const cJSON *arr, int id) {
+    const cJSON *it;
+    cJSON_ArrayForEach(it, arr) {
+        if (cJSON_IsNumber(it) && it->valueint == id) return 1;
+    }
+    return 0;
+}
+
+static int cover_exists(CURL *curl, int id) {
+    char url[128];
+    snprintf(url, sizeof(url), "https://assets.ppy.sh/beatmaps/%d/covers/card.jpg", id);
+
+    curl_easy_reset(curl);
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, UA);
+    curl_easy_setopt(curl, CURLOPT_NOBODY, 1L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
+
+    if (curl_easy_perform(curl) != CURLE_OK) return 0;
+
+    long code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
+    return code == 200;
+}
 
 static size_t libcurl_wdcb(char *data, size_t size, size_t nmemb, void *clientp) {
     size_t realsize = size * nmemb;
@@ -37,7 +64,7 @@ size_t libcurl_download_wdcb(void *ptr, size_t size, size_t nmemb, FILE *stream)
     return written;
 }
 
-static int get_download_url(CURL *curl, int id, const char *session, char *out, size_t outsz) {
+static int get_download_url(CURL *curl, int id, const char *session, char *out, size_t outsz, long *http_code) {
     char page_url[128], referer[128], cookie[4096];
     snprintf(page_url, sizeof(page_url), "https://osu.ppy.sh/beatmapsets/%d/download", id);
     snprintf(referer, sizeof(referer), "https://osu.ppy.sh/beatmapsets/%d", id);
@@ -57,6 +84,8 @@ static int get_download_url(CURL *curl, int id, const char *session, char *out, 
         free(chunk.response);
         return 0;
     }
+
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, http_code);
 
     int ok = 0;
     char *start = strstr(chunk.response, "url='");
@@ -294,6 +323,15 @@ static int extract_images(const char *osz_path, const char *out_dir, int beatmap
     return count;
 }
 
+static void wait_with_countdown(int secs, const char *why) {
+    for (int s = secs; s > 0; s--) {
+        printf("\r\033[2K" ANSI_COLOR_YELLOW "%s Retrying in %ds..." ANSI_COLOR_RESET, why, s);
+        fflush(stdout);
+        sleep(1);
+    }
+    printf("\r\033[2K");
+}
+
 int main(int argc, char** argv) {
     printf("----------------------------------------------\n");
     printf(ANSI_COLOR_BLUE "osubgwalls - Download osu beatmap backgrounds!\n" ANSI_COLOR_RESET);
@@ -366,94 +404,46 @@ int main(int argc, char** argv) {
         printf("\n[%d/%d]\n", n, count);
         int picked_beatmap_id = 0;
 
-        for (;;) {
-            struct libcurl_cb_str search_result_chunk = { 0 };
+        int tries = 0;
+        while (!picked_beatmap_id) {
+            int id = MIN_ID + rand() % (MAX_ID - MIN_ID);
+            if (is_saved(already_saved_json, id)) continue;
 
-            char* random_str = randstring(3);
-
-            char *esc = curl_easy_escape(curl, random_str, 0);
-            char search_url_string[256];
-            snprintf(search_url_string, sizeof(search_url_string), "https://osu.ppy.sh/beatmapsets/search?q=%s", esc);
-            curl_free(esc);
-
-            struct curl_slist *search_header_list = NULL;
-            search_header_list = curl_slist_append(search_header_list, "Accept: application/json");
-            search_header_list = curl_slist_append(search_header_list, "X-Requested-With: XMLHttpRequest");
-
-            curl_easy_reset(curl);
-            curl_easy_setopt(curl, CURLOPT_URL, search_url_string);
-            curl_easy_setopt(curl, CURLOPT_COOKIE, cookie);
-            curl_easy_setopt(curl, CURLOPT_REFERER, "https://osu.ppy.sh/beatmapsets");
-            curl_easy_setopt(curl, CURLOPT_USERAGENT, UA);
-            curl_easy_setopt(curl, CURLOPT_HTTPHEADER, search_header_list);
-            curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, libcurl_wdcb);
-            curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *) &search_result_chunk);
-
-            CURLcode sres = curl_easy_perform(curl);
-            curl_slist_free_all(search_header_list);
-            if (sres != CURLE_OK) return 1;
-
-            cJSON *search_result_chunk_json = cJSON_Parse(search_result_chunk.response);
-            free(search_result_chunk.response);
-            if (search_result_chunk_json == NULL) return 1;
-
-            cJSON* beatmapsets_obj = cJSON_GetObjectItem(search_result_chunk_json, "beatmapsets");
-            if (!beatmapsets_obj) return 1;
-
-            int beatmapsets_array_size = cJSON_GetArraySize(beatmapsets_obj);
-            if (beatmapsets_array_size <= 0) {
-                printf("\r\033[2K" ANSI_COLOR_YELLOW "Got 0 beatmaps with query \"%s\", trying again..." ANSI_COLOR_RESET, random_str);
-                fflush(stdout);
-                cJSON_Delete(search_result_chunk_json);
-                free(random_str);
-                continue;
-            }
-
-            printf("\r\033[2K" ANSI_COLOR_GREEN "Got %d beatmaps with search query: \"%s\"!\n" ANSI_COLOR_RESET, beatmapsets_array_size, random_str);
+            printf("\r\033[2K" ANSI_COLOR_YELLOW "Checking beatmap %d... (%d tried)" ANSI_COLOR_RESET, id, ++tries);
             fflush(stdout);
 
-            for (int i = 0; i < beatmapsets_array_size; i++) {
-                cJSON * subitem = cJSON_GetArrayItem(beatmapsets_obj, i);
-                if (!subitem) continue;
-
-                char* title_string = cJSON_GetStringValue(cJSON_GetObjectItem(subitem, "title"));
-                if (!title_string) continue;
-
-                char* artist_string = cJSON_GetStringValue(cJSON_GetObjectItem(subitem, "artist"));
-                if (!artist_string) continue;
-
-                cJSON* id_obj = cJSON_GetObjectItem(subitem, "id");
-                int beatmap_id = id_obj->valueint;
-                if (!beatmap_id) continue;
-
-                int already = 0;
-                cJSON *it;
-                cJSON_ArrayForEach(it, already_saved_json) {
-                    if (cJSON_IsNumber(it) && it->valueint == beatmap_id) {
-                        already = 1;
-                        break;
-                    }
-                }
-                if (already) continue;
-
-                printf(ANSI_COLOR_BLUE "[%d] \"%s - %s\" chosen! Downloading beatmap...\n" ANSI_COLOR_RESET, beatmap_id, artist_string, title_string);
-                picked_beatmap_id = beatmap_id;
-                break;
-            }
-
-            cJSON_Delete(search_result_chunk_json);
-            free(random_str);
-
-            if (picked_beatmap_id) break;   // only stop once we actually found a new one
-            printf("Everything in that search was already saved, trying again...\n");
+            if (!cover_exists(curl, id)) continue;
+            picked_beatmap_id = id;
         }
+
+        printf("\r\033[2K" ANSI_COLOR_BLUE "[%d] https://osu.ppy.sh/beatmapsets/%d chosen! Downloading beatmap...\n" ANSI_COLOR_RESET, picked_beatmap_id, picked_beatmap_id);
         curl_easy_reset(curl);
 
+        int fails_in_a_row = 0;
         char real_url[1024];
-        if (!get_download_url(curl, picked_beatmap_id, session, real_url, sizeof(real_url))) {
-            fprintf(stderr, "Couldn't get download URL (session expired?).\n");
-            break;
+        int got_url = 0;
+        long http = 0;
+
+        for (int attempt = 0; attempt < 4 && !got_url; attempt++) {
+            if (attempt > 0) {
+                char why[96];
+                snprintf(why, sizeof(why), "No download link (HTTP %ld), maybe rate limited.", http);
+                wait_with_countdown(30 * attempt, why);
+            }
+            got_url = get_download_url(curl, picked_beatmap_id, session, real_url, sizeof(real_url), &http);
+            if (!got_url && (http == 404 || http == 410)) break;   // gone/deleted idk
         }
+
+        if (!got_url) {
+            if (++fails_in_a_row >= 2) {
+                fprintf(stderr, "Failed twice in a row (last HTTP %ld). Session expired or blocked, stopping.\n", http);
+                break;
+            }
+            printf(ANSI_COLOR_YELLOW "Skipping %d, it won't give a download link.\n" ANSI_COLOR_RESET, picked_beatmap_id);
+            n--; 
+            continue;
+        }
+        fails_in_a_row = 0;
 
         char out_name[64];
         snprintf(out_name, sizeof(out_name), "%d.osz", picked_beatmap_id);
